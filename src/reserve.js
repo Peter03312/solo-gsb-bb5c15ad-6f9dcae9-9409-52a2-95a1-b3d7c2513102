@@ -143,10 +143,14 @@ export function availabilitySegments(usedIntervals, suspendedIntervals, s, e) {
 // capacityOf:  (mass) => 当前录入可选数量（无该规格返回 0）
 // overlapping: 与 [startMs,endMs) 重叠的生效中预约 [{startMs, endMs, usage:[{mass,count}]}]
 // suspensions: 与 [startMs,endMs) 重叠的生效中停用（同格式，count 为停用数量，可选）
+// 判定按左闭右开时段逐段进行：仅当某一时刻「既有占用 + 停用量 + 本次需求」
+// 同时超出当前库存才拒绝——预约占用峰值与停用峰值发生在不同时刻（错峰）时
+// 不相加，任一时刻均未超库存即可容纳。
 // 返回 { ok, conflicts }；conflicts 元素：
 //   { mass, required, capacity, peak, peakSuspended,
 //     windows:[{start,end,used,suspended}] }
-//   windows 为「既有占用 + 本次需求 + 停用量 > 当前数量」的合并时段（ISO 字符串）。
+//   windows 为「既有占用 + 本次需求 + 停用量 > 当前数量」的合并时段（ISO 字符串），
+//   即真实冲突时段；peak/peakSuspended 为窗口内占用/停用各自峰值（展示用）。
 export function checkCapacity({
   usage,
   capacityOf,
@@ -180,9 +184,9 @@ export function checkCapacity({
     );
     const peak = segments.reduce((m, seg) => Math.max(m, seg.used), 0);
     const peakSuspended = segments.reduce((m, seg) => Math.max(m, seg.suspended), 0);
-    if (peak + u.count + peakSuspended <= capacity) continue;
 
-    // 超限时窗：used + suspended > capacity - required 的连续段（相邻合并，峰值取段内最大）
+    // 逐段判定：used + suspended > capacity - required 的连续段为真实冲突时段
+    // （相邻合并，峰值取段内最大）；全部分段均未超限即可容纳，不因错峰误拒。
     const limit = capacity - u.count;
     const windows = [];
     for (const seg of segments) {
@@ -201,6 +205,7 @@ export function checkCapacity({
         });
       }
     }
+    if (windows.length === 0) continue;
     conflicts.push({
       mass: u.mass,
       required: u.count,

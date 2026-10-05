@@ -398,6 +398,97 @@ test('/api/state 含 suspensions 列表', async () => {
   assert.ok('phase' in sample && 'revocable' in sample);
 });
 
+// ---------- 错峰容量判定（逐段：占用与停用峰值错开时不相加） ----------
+
+const D2 = (s) => `2027-03-02T${s}:00.000Z`;
+
+test('错峰不拒：占用峰值与停用峰值错开、任一时刻均未超库存 → 201', async () => {
+  // 库存 2：预约 S-RES-ST1 [09,11) 占用 1；停用 [11,13) 停用 1（首尾相接、错峰）
+  const res = await call('POST', '/api/reservations', {
+    batchNo: 'S-RES-ST1',
+    publicationId: pubId,
+    startUtc: D2('09:00'),
+    endUtc: D2('11:00'),
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.json));
+  const sus = await call('POST', '/api/suspensions', {
+    mass: 50,
+    quantity: 1,
+    reason: '错峰停用',
+    startUtc: D2('11:00'),
+    endUtc: D2('13:00'),
+  });
+  assert.equal(sus.status, 201, JSON.stringify(sus.json));
+
+  // 新预约覆盖 [09,13) 需 1：[09,11) 1+0+1=2 ≤ 2；[11,13) 0+1+1=2 ≤ 2 → 可容纳
+  // （旧逻辑把错峰峰值相加 1+1+1=3 > 2 误拒 409 且冲突时段为空）
+  const ok = await call('POST', '/api/reservations', {
+    batchNo: 'S-RES-ST2',
+    publicationId: pubId,
+    startUtc: D2('09:00'),
+    endUtc: D2('13:00'),
+  });
+  assert.equal(ok.status, 201, JSON.stringify(ok.json));
+  assert.equal(ok.json.status, 'active');
+
+  // 幂等重放：同号同内容 → 200 原记录
+  const replay = await call('POST', '/api/reservations', {
+    batchNo: 'S-RES-ST2',
+    publicationId: pubId,
+    startUtc: D2('09:00'),
+    endUtc: D2('13:00'),
+  });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.id, ok.json.id);
+});
+
+test('真实同时超限：409 指出真实冲突规格、时段与数量，不留部分占用', async () => {
+  const before = (await call('GET', '/api/reservations')).json.length;
+  // [09:30,10:30) 内 S-RES-ST1 与 S-RES-ST2 各占用 1（合计 2 = 库存），再需 1 → 真实超限；
+  // 冲突时段应精确为请求时段本身（该段 used=2、suspended=0）
+  const r = await call('POST', '/api/reservations', {
+    batchNo: 'S-RES-ST3',
+    publicationId: pubId,
+    startUtc: D2('09:30'),
+    endUtc: D2('10:30'),
+  });
+  assert.equal(r.status, 409, JSON.stringify(r.json));
+  const c = r.json.detail.conflicts[0];
+  assert.equal(c.mass, 50);
+  assert.equal(c.required, 1);
+  assert.equal(c.capacity, 2);
+  assert.equal(c.windows.length, 1);
+  assert.equal(c.windows[0].start, D2('09:30'));
+  assert.equal(c.windows[0].end, D2('10:30'));
+  assert.equal(c.windows[0].used, 2);
+  assert.equal(c.windows[0].suspended, 0);
+  // 响应字段保留：peak/peakSuspended（窗口内占用/停用各自峰值）
+  assert.equal(c.peak, 2);
+  assert.equal(c.peakSuspended, 0);
+  // 失败不留部分占用
+  const afterN = (await call('GET', '/api/reservations')).json.length;
+  assert.equal(afterN, before);
+});
+
+test('逐段判定：请求时段内仅部分区段超限 → 409 冲突时段为真实超限区段', async () => {
+  // [12:30,13:30)：与错峰停用 [11,13) 相交于 [12:30,13)（停用 1 + 需求 1 = 2 ≤ 2 可行），
+  // 但 S-RES-ST2 [09,13) 占用 1 → [12:30,13) 占用1+停用1+需求1 = 3 > 2 真实超限；
+  // [13,13:30) 无任何占用/停用 → 可行。冲突时段应精确为 [12:30,13)
+  const r = await call('POST', '/api/reservations', {
+    batchNo: 'S-RES-ST4',
+    publicationId: pubId,
+    startUtc: D2('12:30'),
+    endUtc: D2('13:30'),
+  });
+  assert.equal(r.status, 409, JSON.stringify(r.json));
+  const c = r.json.detail.conflicts[0];
+  assert.equal(c.windows.length, 1);
+  assert.equal(c.windows[0].start, D2('12:30'));
+  assert.equal(c.windows[0].end, D2('13:00'));
+  assert.equal(c.windows[0].used, 1);
+  assert.equal(c.windows[0].suspended, 1);
+});
+
 // ---------- 纯函数测试 ----------
 
 test('availabilitySegments：双层扫描线，左闭右开', () => {

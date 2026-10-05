@@ -445,6 +445,75 @@ test('无可行时段 → 409（附诊断），不留任何记录', async () => 
   assert.deepEqual(after0, before0);
 });
 
+test('设备占用无解时不误报配重不足：错峰资源逐段可容纳，409 仅指设备', async () => {
+  // 库存 50 g × 3（重新发布同图新库存）；窗口 [T0+80h, T0+84h)：
+  //   预约 R1/R2 [80,82) 各占用 1（峰值 2）；停用 [82,84) × 2（峰值 2）——错峰，
+  //   任一时刻 占用+停用+需求1 ≤ 3，配重全程可行；
+  //   设备 CENT-STAG 被 R1 排班 [80,82) 与零配重图预约 R3 排班 [82,84) 占满全程。
+  await call('PUT', '/api/weights', [{ mass: 50, quantity: 3 }]);
+  const pubW3 = (await call('POST', '/api/publish')).json.id;
+
+  const mkRes = async (batchNo, pub, s, e) => {
+    const r = await call('POST', '/api/reservations', {
+      batchNo, publicationId: pub, startUtc: iso(s), endUtc: iso(e),
+    });
+    assert.equal(r.status, 201, `${batchNo}: ${JSON.stringify(r.json)}`);
+    return r.json.id;
+  };
+  const r1 = await mkRes('BK-STAG-R1', pubW3, T0 + 80 * H, T0 + 82 * H);
+  await mkRes('BK-STAG-R2', pubW3, T0 + 80 * H, T0 + 82 * H);
+  const sch1 = await call('POST', '/api/schedules', { reservationId: r1, deviceNo: 'CENT-STAG' });
+  assert.equal(sch1.status, 201, JSON.stringify(sch1.json));
+  const sus = await call('POST', '/api/suspensions', {
+    mass: 50, quantity: 2, reason: '错峰停用',
+    startUtc: iso(T0 + 82 * H), endUtc: iso(T0 + 84 * H),
+  });
+  assert.equal(sus.status, 201, JSON.stringify(sus.json));
+
+  // 零配重装载图（两管对径自平衡）→ 预约 R3 占设备时段但不占配重
+  await call('PUT', '/api/tubes', [
+    { id: 'A', mass: 50, usableHoles: [0, 1, 2, 3] },
+    { id: 'B', mass: 50, usableHoles: [0, 1, 2, 3] },
+  ]);
+  const pubZero = (await call('POST', '/api/publish')).json.id;
+  const r3 = await mkRes('BK-STAG-R3', pubZero, T0 + 82 * H, T0 + 84 * H);
+  const sch3 = await call('POST', '/api/schedules', { reservationId: r3, deviceNo: 'CENT-STAG' });
+  assert.equal(sch3.status, 201, JSON.stringify(sch3.json));
+
+  // 恢复单管数据 → pubW3 重新可用（指纹复原）
+  await call('PUT', '/api/tubes', [{ id: 'A', mass: 50, usableHoles: [0, 1, 2, 3] }]);
+
+  // 唯一候选设备 CENT-STAG 全程被占 → 无解；但配重逐段可容纳，
+  // 不应把错峰资源误报为配重不足（旧逻辑 峰值2+停用峰值2+需求1=5>3 误报）
+  const no = await call('POST', '/api/bookings', {
+    batchNo: 'BK-STAG-1', publicationId: pubW3, durationSeconds: 3600,
+    windowStartUtc: iso(T0 + 80 * H), windowEndUtc: iso(T0 + 84 * H),
+    deviceNos: ['CENT-STAG'],
+  });
+  assert.equal(no.status, 409, JSON.stringify(no.json));
+  assert.equal(no.json.detail.reason, 'noFeasibleSlot');
+  assert.deepEqual(no.json.detail.weightConflicts, []); // 不误报配重不足
+  assert.ok(!no.json.errors.join(' ').includes('配重容量不足'));
+  const busy = no.json.detail.deviceBusy.find((d) => d.deviceNo === 'CENT-STAG');
+  assert.ok(busy);
+  assert.equal(busy.busy.length, 2); // [80,82) 与 [82,84) 两段占用
+
+  // 同一窗口换一台空闲设备：错峰资源可容纳 → 201，起点即窗口起点
+  const yes = await call('POST', '/api/bookings', {
+    batchNo: 'BK-STAG-2', publicationId: pubW3, durationSeconds: 3600,
+    windowStartUtc: iso(T0 + 80 * H), windowEndUtc: iso(T0 + 84 * H),
+    deviceNos: ['CENT-STAG-FREE'],
+  });
+  assert.equal(yes.status, 201, JSON.stringify(yes.json));
+  assert.equal(yes.json.startUtc, iso(T0 + 80 * H));
+  assert.equal(yes.json.deviceNo, 'CENT-STAG-FREE');
+
+  // 恢复库存 2 → 原 pubId 重新可用（后续用例不受影响）
+  await call('PUT', '/api/weights', [{ mass: 50, quantity: 2 }]);
+  const pub = await call('GET', `/api/publications/${pubId}`);
+  assert.equal(pub.json.usable, true);
+});
+
 test('生成的预约/排班是普通记录：出现在既有列表中，取消语义不变', async () => {
   const list = await call('GET', '/api/bookings');
   const bk = list.json.find((b) => b.batchNo === 'BK-004');

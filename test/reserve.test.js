@@ -412,6 +412,38 @@ test('checkCapacity：超限时返回冲突规格与合并时段', () => {
   assert.equal(ok.ok, true);
 });
 
+test('checkCapacity：错峰的占用峰值与停用峰值不相加（逐段判定）', () => {
+  // 库存 2：预约占用 1 枚 [0,10)，停用 1 枚 [10,20)（首尾相接、错峰）；
+  // 需求 1 → 任一时刻 占用+停用+需求 ≤ 2 → 可容纳（旧逻辑 1+1+1=3>2 误拒且冲突时段为空）
+  const ok = checkCapacity({
+    usage: [{ mass: 50, count: 1 }],
+    capacityOf: () => 2,
+    overlapping: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    suspensions: [{ startMs: 10, endMs: 20, mass: 50, count: 1 }],
+    startMs: 0,
+    endMs: 20,
+  });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.conflicts, []);
+
+  // 部分时段真实同时超限：仅 [5,10) 内 占用1+停用1+需求1 = 3 > 2 → 拒绝且指出真实时段
+  const r = checkCapacity({
+    usage: [{ mass: 50, count: 1 }],
+    capacityOf: () => 2,
+    overlapping: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    suspensions: [{ startMs: 5, endMs: 20, mass: 50, count: 1 }],
+    startMs: 0,
+    endMs: 15,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.conflicts.length, 1);
+  assert.equal(r.conflicts[0].windows.length, 1);
+  assert.equal(r.conflicts[0].windows[0].start, new Date(5).toISOString());
+  assert.equal(r.conflicts[0].windows[0].end, new Date(10).toISOString());
+  assert.equal(r.conflicts[0].windows[0].used, 1);
+  assert.equal(r.conflicts[0].windows[0].suspended, 1);
+});
+
 test('buildSchedule：占用分段与不足标记', () => {
   const specs = buildSchedule({
     reservations: [
