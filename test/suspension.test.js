@@ -530,3 +530,67 @@ test('buildSchedule：停用量、占用不足与合计不足分段', () => {
     [[new Date(5).toISOString(), new Date(10).toISOString(), 1, 2]],
   );
 });
+
+// ---------- 错峰容量判定（占用峰值与停用峰值不得跨时刻相加） ----------
+
+const T2 = (s) => `2027-03-02T${s}:00.000Z`;
+
+test('错峰：预约占用与停用不同时刻分别达峰，任一时刻均未超库存 → 201 原子创建', async () => {
+  // 2027-03-02，库存 50 g × 2、冻结图需 50 g × 1：
+  //   既有预约 [09,11) 占用 1；既有停用 [13,15) 停用 1（两者错峰）；
+  //   新预约 [08,16) 需 1：任一时刻「占用 + 停用 + 需求」最高 2 ≤ 2 → 可预约。
+  const res = await call('POST', '/api/reservations', {
+    batchNo: 'STAG-RES-1',
+    publicationId: pubId,
+    startUtc: T2('09:00'),
+    endUtc: T2('11:00'),
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.json));
+  const susp = await call('POST', '/api/suspensions', {
+    mass: 50,
+    quantity: 1,
+    reason: '错峰停用',
+    startUtc: T2('13:00'),
+    endUtc: T2('15:00'),
+  });
+  assert.equal(susp.status, 201, JSON.stringify(susp.json));
+
+  const r = await call('POST', '/api/reservations', {
+    batchNo: 'STAG-RES-2',
+    publicationId: pubId,
+    startUtc: T2('08:00'),
+    endUtc: T2('16:00'),
+  });
+  // 修复前：409 且 detail.conflicts[0].windows 为空（错峰峰值被相加）
+  assert.equal(r.status, 201, JSON.stringify(r.json));
+  assert.equal(r.json.status, 'active');
+  assert.deepEqual(r.json.usage, [{ mass: 50, count: 1 }]);
+});
+
+test('真实同时超限仍 409：指出真实冲突规格、逐段时段与数量，不留部分占用', async () => {
+  // 上一步后（2027-03-02）：[09,11) 占用 2（STAG-RES-1 + STAG-RES-2）、
+  // [13,15) 占用 1（STAG-RES-2）+ 停用 1。
+  // 新预约 [10,14) 需 1：[10,11) 2+0+1=3>2；[13,14) 1+1+1=3>2 → 两段真实冲突。
+  const before = (await call('GET', '/api/reservations')).json.length;
+  const r = await call('POST', '/api/reservations', {
+    batchNo: 'STAG-RES-3',
+    publicationId: pubId,
+    startUtc: T2('10:00'),
+    endUtc: T2('14:00'),
+  });
+  assert.equal(r.status, 409, JSON.stringify(r.json));
+  const c = r.json.detail.conflicts[0];
+  assert.equal(c.mass, 50);
+  assert.equal(c.required, 1);
+  assert.equal(c.capacity, 2);
+  assert.equal(c.windows.length, 2);
+  assert.deepEqual(
+    c.windows.map((w) => [w.start, w.end, w.used, w.suspended]),
+    [
+      [T2('10:00'), T2('11:00'), 2, 0],
+      [T2('13:00'), T2('14:00'), 1, 1],
+    ],
+  );
+  // 整单拒绝：不产生任何占用
+  assert.equal((await call('GET', '/api/reservations')).json.length, before);
+});

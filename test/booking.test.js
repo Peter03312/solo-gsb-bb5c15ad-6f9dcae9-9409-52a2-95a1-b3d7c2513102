@@ -479,6 +479,76 @@ test('查询：GET /api/bookings、GET /api/bookings/:id、/api/state.bookings',
   assert.ok(state.json.bookings.some((b) => b.batchNo === 'BK-001'));
 });
 
+test('设备占用导致无解时，错峰的占用与停用不误报为配重不足', async () => {
+  // 窗口 W = [T0+80h, T0+86h)：库存 50 g × 2、冻结图需 50 g × 1。
+  // 配重错峰：预约占用 1 枚 [W, W+2h)、停用 1 枚 [W+3h, W+5h)——
+  // 任一时刻「占用 + 停用 + 需求」最高 2 ≤ 2，配重全程可行；
+  // 唯一候选设备 CENT-STAG 全程被占 → 无解只能来自设备。
+  const W = T0 + 80 * H;
+  const r1 = await call('POST', '/api/reservations', {
+    batchNo: 'BK-STAG-RES',
+    publicationId: pubId,
+    startUtc: iso(W),
+    endUtc: iso(W + 2 * H),
+  });
+  assert.equal(r1.status, 201, JSON.stringify(r1.json));
+  const susp = await call('POST', '/api/suspensions', {
+    mass: 50,
+    quantity: 1,
+    reason: '错峰停用',
+    startUtc: iso(W + 3 * H),
+    endUtc: iso(W + 5 * H),
+  });
+  assert.equal(susp.status, 201, JSON.stringify(susp.json));
+
+  // 用纯离心管发布图（不占配重）建一条覆盖整窗的预约并排到 CENT-STAG
+  await call('PUT', '/api/tubes', [
+    { id: 'A', mass: 50, usableHoles: [0, 1, 2, 3] },
+    { id: 'B', mass: 50, usableHoles: [0, 1, 2, 3] },
+  ]);
+  const pub2 = await call('POST', '/api/publish');
+  assert.equal(pub2.status, 201, JSON.stringify(pub2.json));
+  assert.equal(pub2.json.result.weightCount, 0);
+  const r2 = await call('POST', '/api/reservations', {
+    batchNo: 'BK-STAG-DEV',
+    publicationId: pub2.json.id,
+    startUtc: iso(W),
+    endUtc: iso(W + 6 * H),
+  });
+  assert.equal(r2.status, 201, JSON.stringify(r2.json));
+  const sch = await call('POST', '/api/schedules', {
+    reservationId: r2.json.id,
+    deviceNo: 'CENT-STAG',
+  });
+  assert.equal(sch.status, 201, JSON.stringify(sch.json));
+
+  // 恢复原录入，pubId 重新可用
+  await call('PUT', '/api/tubes', [{ id: 'A', mass: 50, usableHoles: [0, 1, 2, 3] }]);
+  assert.equal((await call('GET', `/api/publications/${pubId}`)).json.usable, true);
+
+  const before0 = await counts();
+  const r = await call('POST', '/api/bookings', {
+    batchNo: 'BK-STAG',
+    publicationId: pubId,
+    durationSeconds: 7200,
+    windowStartUtc: iso(W),
+    windowEndUtc: iso(W + 6 * H),
+    deviceNos: ['CENT-STAG'],
+  });
+  assert.equal(r.status, 409, JSON.stringify(r.json));
+  assert.equal(r.json.detail.reason, 'noFeasibleSlot');
+  // 配重错峰可行 → 不得误报配重不足（修复前：weightConflicts 非空且 windows 为空）
+  assert.deepEqual(r.json.detail.weightConflicts, []);
+  assert.ok(!r.json.errors.join(' ').includes('配重容量不足'));
+  // 设备占用如实呈现
+  const busy = r.json.detail.deviceBusy.find((d) => d.deviceNo === 'CENT-STAG');
+  assert.ok(busy);
+  assert.deepEqual(busy.busy, [{ start: iso(W), end: iso(W + 6 * H) }]);
+  // 不留任何记录
+  const after0 = await counts();
+  assert.deepEqual(after0, before0);
+});
+
 // ---------- 纯函数 ----------
 
 test('纯函数：normalizeBookingInput', () => {

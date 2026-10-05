@@ -412,6 +412,42 @@ test('checkCapacity：超限时返回冲突规格与合并时段', () => {
   assert.equal(ok.ok, true);
 });
 
+test('checkCapacity：错峰的占用峰值与停用峰值不相加（逐段判定）', () => {
+  // 库存 2、本次需 1：预约占用峰值 1 在 [0,10)，停用峰值 1 在 [10,20)（错峰），
+  // 任一时刻「占用 + 停用 + 需求」最高 2 ≤ 2 → 可预约
+  const staggered = checkCapacity({
+    usage: [{ mass: 50, count: 1 }],
+    capacityOf: () => 2,
+    overlapping: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    suspensions: [{ startMs: 10, endMs: 20, mass: 50, count: 1 }],
+    startMs: 0,
+    endMs: 20,
+  });
+  assert.equal(staggered.ok, true);
+  assert.deepEqual(staggered.conflicts, []);
+
+  // 部分时刻叠加超限：占用 [0,10)、停用 [5,20)，库存 2、需 1 → 仅 [5,10) 同时超限
+  const partial = checkCapacity({
+    usage: [{ mass: 50, count: 1 }],
+    capacityOf: () => 2,
+    overlapping: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    suspensions: [{ startMs: 5, endMs: 20, mass: 50, count: 1 }],
+    startMs: 0,
+    endMs: 20,
+  });
+  assert.equal(partial.ok, false);
+  assert.equal(partial.conflicts.length, 1);
+  assert.equal(partial.conflicts[0].mass, 50);
+  assert.equal(partial.conflicts[0].required, 1);
+  assert.equal(partial.conflicts[0].capacity, 2);
+  // 冲突时段为真实同时超限的 [5,10)，而非整个时段
+  assert.equal(partial.conflicts[0].windows.length, 1);
+  assert.equal(partial.conflicts[0].windows[0].start, new Date(5).toISOString());
+  assert.equal(partial.conflicts[0].windows[0].end, new Date(10).toISOString());
+  assert.equal(partial.conflicts[0].windows[0].used, 1);
+  assert.equal(partial.conflicts[0].windows[0].suspended, 1);
+});
+
 test('buildSchedule：占用分段与不足标记', () => {
   const specs = buildSchedule({
     reservations: [
